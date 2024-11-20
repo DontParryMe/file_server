@@ -13,6 +13,9 @@ from app.database import create_tables, AsyncSessionLocal
 from app.models.files_table import UploadedFile
 import urllib.parse
 
+from app.utils import get_db
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await database.connect()
@@ -25,17 +28,20 @@ app = FastAPI(lifespan=lifespan)
 
 database = Database(os.environ['DATABASE_URL'])
 
-async def get_db() -> AsyncSession:
-    async with AsyncSessionLocal() as session:
-        yield session
-
 @app.post("/upload/")
 async def upload_file(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
-    file_content = await file.read()
+    chunk_size = 1024 * 1024
+    content = bytearray()
+
+    while True:
+        chunk = await file.read(chunk_size)
+        if not chunk:
+            break
+        content.extend(chunk)
 
     db_file = UploadedFile(
         filename=file.filename,
-        content=file_content,
+        content=bytes(content),
         content_type=file.content_type
     )
 
@@ -60,12 +66,17 @@ async def download_file(file_id: int, db: AsyncSession = Depends(get_db)):
     if db_file is None:
         raise HTTPException(status_code=404, detail="File not found")
 
-    file_like = BytesIO(db_file.content)
-    file_like.seek(0)
-
     filename = urllib.parse.quote(db_file.filename)
 
+    async def file_iterator(content: bytes, chunk_size: int = 1024 * 1024):
+        start = 0
+        while start < len(content):
+            end = min(start + chunk_size, len(content))
+            yield content[start:end]
+            start = end
+
     return StreamingResponse(
-        file_like, media_type=db_file.content_type,
+        file_iterator(db_file.content),
+        media_type=db_file.content_type,
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
     )
